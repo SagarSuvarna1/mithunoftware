@@ -1,4 +1,11 @@
 {
+  "name": "temple-billing",
+  "version": "1.0.0",
+  "description": "Temple Billing & Expense Management System",
+  "main": "apppgadmin.js",
+  "scripts": {
+    "start": "node apppgadmin.js"
+  },
   "dependencies": {
     "bcrypt": "^6.0.0",
     "bcryptjs": "^3.0.2",
