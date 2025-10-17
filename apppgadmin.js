@@ -1,4 +1,3 @@
-// PostgreSQL version of your temple billing system
 const express = require('express');
 const session = require('express-session');
 const { Pool } = require('pg');
@@ -8,12 +7,11 @@ const ExcelJS = require('exceljs');
 const moment = require('moment');
 
 const app = express();
+
+// Cloud (Render) and Local DB setup
 const db = new Pool({
-  user: 'postgres',
-  host: 'localhost',
-  database: 'temple_pg',
-  password: 'sagar',
-  port: 5432
+  connectionString: process.env.DATABASE_URL || 'postgres://postgres:sagar@localhost:5432/temple_pg',
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
 function getFiscalYear() {
@@ -26,6 +24,7 @@ function getFiscalYear() {
 }
 
 app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views')); // Always set views directory for EJS
 app.use(express.static('public'));
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(session({
@@ -34,6 +33,7 @@ app.use(session({
   saveUninitialized: true,
   cookie: { maxAge: 15 * 60 * 1000 }
 }));
+
 
 app.get('/', (req, res) => {
   res.render('login', { error: null });
