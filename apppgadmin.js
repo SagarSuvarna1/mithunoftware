@@ -1,6 +1,6 @@
 const express = require('express');
 const session = require('express-session');
-const { Pool } = require('pg');
+const sqlite3 = require('sqlite3').verbose();
 const bodyParser = require('body-parser');
 const path = require('path');
 const ExcelJS = require('exceljs');
@@ -8,10 +8,13 @@ const moment = require('moment');
 
 const app = express();
 
-// Cloud (Render) and Local DB setup
-const db = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgres://postgres:sagar@localhost:5432/temple_pg',
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+// SQLite DB connection
+const db = new sqlite3.Database('./temple.db', (err) => {
+  if (err) {
+    console.error('❌ SQLite connection error:', err.message);
+  } else {
+    console.log('✅ Connected to SQLite database.');
+  }
 });
 
 function getFiscalYear() {
@@ -24,7 +27,6 @@ function getFiscalYear() {
 }
 
 app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views')); // Always set views directory for EJS
 app.use(express.static('public'));
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(session({
@@ -34,16 +36,22 @@ app.use(session({
   cookie: { maxAge: 15 * 60 * 1000 }
 }));
 
-
+// Login Page
 app.get('/', (req, res) => {
   res.render('login', { error: null });
 });
 
-app.post('/login', async (req, res) => {
+// Login POST (SQLite)
+app.post('/login', (req, res) => {
   const { username, password } = req.body;
-  try {
-    const result = await db.query('SELECT * FROM users WHERE username = $1 AND password = $2', [username, password]);
-    const row = result.rows[0];
+
+  const sql = 'SELECT * FROM users WHERE username = ? AND password = ?';
+  db.get(sql, [username, password], (err, row) => {
+    if (err) {
+      console.error('❌ Login error:', err.message);
+      return res.render('login', { error: 'Login failed.' });
+    }
+
     if (row) {
       req.session.user = row;
       req.session.loginTime = new Date();
@@ -51,18 +59,37 @@ app.post('/login', async (req, res) => {
     } else {
       res.render('login', { error: 'Invalid login.' });
     }
-  } catch (err) {
-    console.error(err);
-    res.render('login', { error: 'Login failed.' });
-  }
+  });
 });
 
+// Logout
 app.get('/logout', (req, res) => {
   req.session.destroy(() => {
     res.redirect('/');
   });
 });
-// Required: express, db (your database instance), session middleware configured
+
+// Helper to promisify db.all
+function dbAllAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
+
+// Helper to promisify db.get
+function dbGetAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
+
+// Dashboard route
 app.get('/dashboard', async (req, res) => {
   if (!req.session.user) return res.redirect('/');
 
@@ -84,9 +111,8 @@ app.get('/dashboard', async (req, res) => {
       break;
 
     case 'week':
-      // Week starting Monday
       const today = new Date();
-      const day = today.getDay() || 7; // Sunday=0, so treat as 7
+      const day = today.getDay() || 7;
       const monday = new Date(today);
       monday.setDate(today.getDate() - day + 1);
       startDate = formatDate(monday);
@@ -99,7 +125,6 @@ app.get('/dashboard', async (req, res) => {
       break;
 
     case 'custom':
-      // Use query params, fallback to today if not valid
       startDate = startParam || formatDate(current);
       endDate = endParam || formatDate(current);
       break;
@@ -110,85 +135,91 @@ app.get('/dashboard', async (req, res) => {
       break;
   }
 
-  const billDateSql = startDate !== endDate
-    ? `bill_date::date BETWEEN $1 AND $2`
-    : `bill_date::date = $1`;
-
-  const params = startDate !== endDate ? [startDate, endDate] : [startDate];
+  const isRange = startDate !== endDate;
+  const dateCondition = isRange
+    ? `date(bill_date) BETWEEN ? AND ?`
+    : `date(bill_date) = ?`;
+  const dateParams = isRange ? [startDate, endDate] : [startDate];
 
   try {
-    const [
-      topPoojasRes, totalRes, userTotalRes, paymentModeSplitRes,
-      userWiseRes, donationTotalRes, trendsRes
-    ] = await Promise.all([
-      // Top 5 Poojas excluding donations
-      db.query(
-        `SELECT pooja_name, SUM(qty) as count
-         FROM billing
-         WHERE ${billDateSql} AND pooja_name NOT ILIKE 'Donation%'
-         GROUP BY pooja_name ORDER BY count DESC LIMIT 5`,
-        params
-      ),
+    // Top 5 Poojas excluding donations
+    const topPoojas = await dbAllAsync(
+      `SELECT pooja_name, SUM(qty) as count
+       FROM billing
+       WHERE ${dateCondition} AND pooja_name NOT LIKE 'Donation%' COLLATE NOCASE
+       GROUP BY pooja_name
+       ORDER BY count DESC
+       LIMIT 5`,
+      dateParams
+    );
 
-      // Total collection
-      db.query(
-        `SELECT SUM(total) as total FROM billing WHERE ${billDateSql}`,
-        params
-      ),
+    // Total collection
+    const totalRes = await dbGetAsync(
+      `SELECT SUM(total) AS total FROM billing WHERE ${dateCondition}`,
+      dateParams
+    );
 
-      // User total
-      db.query(
-        `SELECT SUM(total) as total FROM billing WHERE ${billDateSql} AND username = $${params.length + 1}`,
-        [...params, username]
-      ),
+    // User total
+    const userTotalRes = await dbGetAsync(
+      `SELECT SUM(total) AS total FROM billing WHERE ${dateCondition} AND username = ?`,
+      [...dateParams, username]
+    );
 
-      // Payment mode totals (online / cash)
-      db.query(
-        `SELECT payment_mode, SUM(total) as total FROM billing WHERE ${billDateSql} GROUP BY payment_mode`,
-        params
-      ),
+    // Payment mode totals
+    const paymentModes = await dbAllAsync(
+      `SELECT payment_mode, SUM(total) AS total
+       FROM billing
+       WHERE ${dateCondition}
+       GROUP BY payment_mode`,
+      dateParams
+    );
 
-      // Collection by user
-      db.query(
-        `SELECT username, SUM(total) as total FROM billing WHERE ${billDateSql} GROUP BY username ORDER BY total DESC`,
-        params
-      ),
+    // Collection by user
+    const userwise = await dbAllAsync(
+      `SELECT username, SUM(total) AS total
+       FROM billing
+       WHERE ${dateCondition}
+       GROUP BY username
+       ORDER BY total DESC`,
+      dateParams
+    );
 
-      // Donation totals
-      db.query(
-        `SELECT SUM(total) as total FROM billing WHERE ${billDateSql} AND pooja_name ILIKE 'Donation%'`,
-        params
-      ),
+    // Donation totals
+    const donationRes = await dbGetAsync(
+      `SELECT SUM(total) AS total
+       FROM billing
+       WHERE ${dateCondition} AND pooja_name LIKE 'Donation%' COLLATE NOCASE`,
+      dateParams
+    );
 
-      // Trends for last 7 days (always last 7 days, can adapt if needed)
-      db.query(
-        `SELECT TO_CHAR(bill_date::date, 'YYYY-MM-DD') as date, SUM(total) as amount
-         FROM billing
-         WHERE bill_date >= CURRENT_DATE - INTERVAL '6 days'
-         GROUP BY bill_date::date
-         ORDER BY date ASC`
-      )
-    ]);
+    // Trends for last 7 days
+    const trends = await dbAllAsync(
+      `SELECT date(bill_date) AS date, SUM(total) AS amount
+       FROM billing
+       WHERE date(bill_date) >= date('now', '-6 days')
+       GROUP BY date(bill_date)
+       ORDER BY date ASC`
+    );
 
+    // Calculate online vs cash totals
     let online_total = 0, cash_total = 0;
-    (paymentModeSplitRes.rows || []).forEach(row => {
+    (paymentModes || []).forEach(row => {
       const mode = (row.payment_mode || '').toLowerCase();
       const total = parseFloat(row.total || 0);
       if (mode.includes('online')) online_total += total;
       else cash_total += total;
     });
 
+    // Render dashboard
     res.render('dashboard', {
-      top_poojas: topPoojasRes.rows || [],
-      total_collection: totalRes.rows[0]?.total || 0,
-      user_total: userTotalRes.rows[0]?.total || 0,
+      top_poojas: topPoojas || [],
+      total_collection: totalRes?.total || 0,
+      user_total: userTotalRes?.total || 0,
       online_total,
       cash_total,
-      donation_total: donationTotalRes.rows[0]?.total || 0,
-      userwise: userWiseRes.rows || [],
-      trends: trendsRes.rows || [],
-
-      // Pass filter info to template
+      donation_total: donationRes?.total || 0,
+      userwise: userwise || [],
+      trends: trends || [],
       range,
       startDate,
       endDate
@@ -199,22 +230,45 @@ app.get('/dashboard', async (req, res) => {
     res.status(500).send("Failed to load dashboard");
   }
 });
+// ---------------- Helper functions ----------------
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => err ? reject(err) : resolve(rows));
+  });
+}
 
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => err ? reject(err) : resolve(row));
+  });
+}
 
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function(err) {
+      if (err) reject(err);
+      else resolve(this); // this.lastID
+    });
+  });
+}
+
+// ---------------- Billing Page (Load Pooja List) ----------------
 app.get('/billing', async (req, res) => {
   if (!req.session.user) return res.redirect('/');
 
   try {
-   const result = await db.query('SELECT * FROM pooja_master WHERE visible = true ORDER BY pooja_name');
-
-    res.render('billing', { poojas: result.rows });
+    const poojas = await dbAll(`SELECT * FROM pooja_master WHERE visible = 1 ORDER BY pooja_name`);
+    res.render('billing', { poojas: poojas || [] });
   } catch (err) {
-    console.error(err);
+    console.error("❌ Error loading billing page:", err);
     res.send("Error loading billing page.");
   }
 });
 
+// ---------------- Billing Submission ----------------
 app.post('/billing', async (req, res) => {
+  if (!req.session.user) return res.redirect('/');
+
   const {
     dev_name,
     pooja_name,
@@ -227,17 +281,8 @@ app.post('/billing', async (req, res) => {
 
   const username = req.session.user.username;
   const fiscalYear = getFiscalYear();
-  const bill_datetime = new Date();
-  const bill_date = bill_datetime.toLocaleString('en-GB', {
-    timeZone: 'Asia/Kolkata',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: true
-  }).replace(',', '');
+  const bill_datetime = new Date().toISOString(); // Store ISO date
+  const bill_date = bill_datetime.split('T')[0];   // YYYY-MM-DD
 
   let price = 0;
   let total = 0;
@@ -245,7 +290,7 @@ app.post('/billing', async (req, res) => {
   let actualPoojaName = pooja_name;
 
   try {
-    // Handle donation
+    // ----- Handle Donation -----
     if (pooja_name === 'Donation') {
       if (!donation_purpose || !donation_amount) {
         return res.send("Donation purpose or amount missing.");
@@ -256,36 +301,31 @@ app.post('/billing', async (req, res) => {
       actualPoojaName = `Donation – ${donation_purpose}`;
     } else {
       if (isNaN(qtyNum) || qtyNum <= 0) return res.send("Invalid quantity");
-
-      const priceResult = await db.query(
-        'SELECT price FROM pooja_master WHERE pooja_name = $1',
-        [pooja_name]
-      );
-      const row = priceResult.rows[0];
-      if (!row) return res.send("Invalid pooja selected.");
-      price = row.price;
+      const poojaRow = await dbGet(`SELECT price FROM pooja_master WHERE pooja_name = ?`, [pooja_name]);
+      if (!poojaRow) return res.send("Invalid pooja selected.");
+      price = poojaRow.price;
       total = price * qtyNum;
     }
 
-    // Generate receipt
-    const lastReceipt = await db.query(
-      'SELECT receipt_no FROM billing WHERE receipt_no LIKE $1 ORDER BY id DESC LIMIT 1',
+    // ----- Generate Receipt Number -----
+    const lastReceipt = await dbGet(
+      `SELECT receipt_no FROM billing WHERE receipt_no LIKE ? ORDER BY id DESC LIMIT 1`,
       [`SRI/${fiscalYear}/%`]
     );
+
     let nextSerial = 1;
-    if (lastReceipt.rows.length > 0) {
-      const parts = lastReceipt.rows[0].receipt_no.split('/');
+    if (lastReceipt) {
+      const parts = lastReceipt.receipt_no.split('/');
       const lastSerial = parseInt(parts[2]);
       nextSerial = isNaN(lastSerial) ? 1 : lastSerial + 1;
     }
     const receipt_no = `SRI/${fiscalYear}/${nextSerial}`;
 
-    // Insert billing record, include reference_id if online
-    const insertResult = await db.query(
-      `INSERT INTO billing 
-        (dev_name, pooja_name, qty, price, total, bill_date, bill_datetime, username, payment_mode, withdrawn, receipt_no, reference_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11)
-       RETURNING id`,
+    // ----- Insert Billing Record -----
+    const result = await dbRun(
+      `INSERT INTO billing
+      (dev_name, pooja_name, qty, price, total, bill_date, bill_datetime, username, payment_mode, withdrawn, receipt_no, reference_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
       [
         dev_name,
         actualPoojaName,
@@ -297,13 +337,13 @@ app.post('/billing', async (req, res) => {
         username,
         payment_mode,
         receipt_no,
-        payment_mode === 'Online' ? reference_id : null
+        payment_mode.toLowerCase() === 'online' ? reference_id : null
       ]
     );
 
-    const bill_id = insertResult.rows[0].id;
+    const bill_id = result.lastID;
 
-    // Render receipt
+    // ----- Render Receipt Page -----
     res.render('receipt', {
       dev_name,
       pooja_name: actualPoojaName,
@@ -314,7 +354,7 @@ app.post('/billing', async (req, res) => {
       bill_date,
       payment_mode,
       receipt_no,
-      reference_id: payment_mode === 'Online' ? reference_id : null
+      reference_id: payment_mode.toLowerCase() === 'online' ? reference_id : null
     });
 
   } catch (err) {
@@ -323,190 +363,228 @@ app.post('/billing', async (req, res) => {
   }
 });
 
+// ----- Helper Promises for SQLite -----
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
 
-// Pooja Master
-// GET Pooja Master Page
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
+
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function(err) {
+      if (err) reject(err);
+      else resolve(this); // use this.lastID
+    });
+  });
+}
+
+// ----- GET Pooja Master Page -----
 app.get('/pooja-master', async (req, res) => {
   if (!req.session.user) return res.redirect('/');
-
   try {
-    const result = await db.query('SELECT * FROM pooja_master ORDER BY id');
-    res.render('pooja', { poojas: result.rows });
+    const poojas = await dbAll(`SELECT * FROM pooja_master ORDER BY id`);
+    res.render('pooja', { poojas: poojas || [] });
   } catch (err) {
-    console.error(err);
+    console.error("❌ Error loading pooja master:", err);
     res.send("Error loading pooja master.");
   }
 });
 
-// ADD a new pooja
+// ----- ADD a New Pooja -----
 app.post('/pooja-master/add', async (req, res) => {
   const { pooja_name, price } = req.body;
+  if (!pooja_name || !price) return res.send("Pooja name and price required.");
 
   try {
-    await db.query('INSERT INTO pooja_master (pooja_name, price, visible) VALUES ($1, $2, true)', [pooja_name, price]);
+    await dbRun(
+      `INSERT INTO pooja_master (pooja_name, price, visible) VALUES (?, ?, 1)`,
+      [pooja_name, price]
+    );
     res.redirect('/pooja-master');
   } catch (err) {
-    console.error(err);
+    console.error("❌ Failed to add pooja:", err);
     res.send("Failed to add pooja.");
   }
 });
 
-// UPDATE price
+// ----- UPDATE Pooja Price -----
 app.post('/pooja-master/update/:id', async (req, res) => {
   const { price } = req.body;
   const id = req.params.id;
+  if (!price) return res.send("Price is required.");
 
   try {
-    await db.query('UPDATE pooja_master SET price = $1 WHERE id = $2', [price, id]);
+    await dbRun(`UPDATE pooja_master SET price = ? WHERE id = ?`, [price, id]);
     res.redirect('/pooja-master');
   } catch (err) {
-    console.error(err);
+    console.error("❌ Failed to update pooja:", err);
     res.send("Failed to update pooja.");
   }
 });
 
-// DELETE pooja
+// ----- DELETE Pooja -----
 app.post('/pooja-master/delete/:id', async (req, res) => {
   const id = req.params.id;
-
   try {
-    await db.query('DELETE FROM pooja_master WHERE id = $1', [id]);
+    await dbRun(`DELETE FROM pooja_master WHERE id = ?`, [id]);
     res.redirect('/pooja-master');
   } catch (err) {
-    console.error(err);
+    console.error("❌ Failed to delete pooja:", err);
     res.send("Failed to delete pooja.");
   }
 });
 
-// TOGGLE Visibility (Hide/Unhide)
+// ----- TOGGLE Visibility (Hide/Unhide) -----
 app.post('/pooja-master/toggle/:id', async (req, res) => {
   const id = req.params.id;
-
   try {
-    const current = await db.query('SELECT visible FROM pooja_master WHERE id = $1', [id]);
-    const isVisible = current.rows[0]?.visible;
-
-    await db.query('UPDATE pooja_master SET visible = $1 WHERE id = $2', [!isVisible, id]);
+    const row = await dbGet(`SELECT visible FROM pooja_master WHERE id = ?`, [id]);
+    const newValue = row?.visible ? 0 : 1;
+    await dbRun(`UPDATE pooja_master SET visible = ? WHERE id = ?`, [newValue, id]);
     res.redirect('/pooja-master');
   } catch (err) {
-    console.error(err);
+    console.error("❌ Failed to toggle visibility:", err);
     res.send("Failed to toggle visibility.");
   }
 });
+// Helper to promisify db.all
+function dbAllAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
 
+// Helper to promisify db.get
+function dbGetAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
 
-
-
-// GET report page
+// GET /report page
 app.get('/report', async (req, res) => {
+  if (!req.session.user) return res.redirect('/');
+
   try {
-    const poojasResult = await db.query('SELECT DISTINCT pooja_name FROM billing');
-    const usersResult = await db.query('SELECT DISTINCT username FROM billing');
-    const paymentModesResult = await db.query('SELECT DISTINCT payment_mode FROM billing');
+    const poojas = await dbAllAsync('SELECT DISTINCT pooja_name FROM billing');
+    const users = await dbAllAsync('SELECT DISTINCT username FROM billing');
+    const paymentModes = await dbAllAsync('SELECT DISTINCT payment_mode FROM billing');
 
     res.render('report', {
-      poojas: poojasResult.rows || [],
-      users: usersResult.rows || [],
-      paymentModes: paymentModesResult.rows || [],
-      results: null
+      poojas: poojas || [],
+      users: users || [],
+      paymentModes: paymentModes || [],
+      results: null,
+      moment
     });
 
   } catch (err) {
-    console.error("❌ GET /report error:", err.message);
-    console.error("📛 Stack:", err.stack);
+    console.error("❌ GET /report error:", err);
     res.status(500).send("Error loading report page.");
   }
 });
 
-
-// POST report page
+// POST /report (filter results)
 app.post('/report', async (req, res) => {
+  if (!req.session.user) return res.redirect('/');
+
   const { from, to, pooja_name, username, payment_mode } = req.body;
 
   const formattedFrom = moment(from, 'D/M/YYYY').format('YYYY-MM-DD');
   const formattedTo = moment(to, 'D/M/YYYY').format('YYYY-MM-DD');
 
-  let sql = `
-    SELECT * FROM billing 
-    WHERE bill_date::DATE BETWEEN $1 AND $2`;
+  let sql = `SELECT * FROM billing WHERE date(bill_date) BETWEEN ? AND ?`;
   const params = [formattedFrom, formattedTo];
 
-  let i = 3;
-
   if (pooja_name) {
-    sql += ` AND pooja_name = $${i++}`;
+    sql += ` AND pooja_name = ?`;
     params.push(pooja_name);
   }
 
   if (username) {
-    sql += ` AND username = $${i++}`;
+    sql += ` AND username = ?`;
     params.push(username);
   }
 
   if (payment_mode) {
-    sql += ` AND LOWER(payment_mode) = $${i++}`;
+    sql += ` AND LOWER(payment_mode) = ?`;
     params.push(payment_mode.toLowerCase());
   }
 
   try {
-    const poojasResult = await db.query('SELECT DISTINCT pooja_name FROM billing');
-    const usersResult = await db.query('SELECT DISTINCT username FROM billing');
-    const paymentModesResult = await db.query('SELECT DISTINCT payment_mode FROM billing');
-    const reportResult = await db.query(sql, params);
+    const poojas = await dbAllAsync('SELECT DISTINCT pooja_name FROM billing');
+    const users = await dbAllAsync('SELECT DISTINCT username FROM billing');
+    const paymentModes = await dbAllAsync('SELECT DISTINCT payment_mode FROM billing');
+    const results = await dbAllAsync(sql, params);
 
-    const moment = require('moment');
-
-res.render('report', {
-  poojas: poojasResult.rows,
-  users: usersResult.rows,
-  paymentModes: paymentModesResult.rows,
-  results: reportResult.rows,
-  moment  // 👈 pass this
-});
+    res.render('report', {
+      poojas,
+      users,
+      paymentModes,
+      results,
+      moment
+    });
 
   } catch (err) {
-    console.error("❌ POST /report error:", err.message);
+    console.error("❌ POST /report error:", err);
     res.status(500).send("Error generating report.");
   }
 });
 
-
+// GET /report/export (export filtered report to Excel)
 app.get('/report/export', async (req, res) => {
+  if (!req.session.user) return res.redirect('/');
+
   const { from, to, pooja_name, username, payment_mode } = req.query;
 
-  if (!from || !to) {
-    return res.status(400).send('Missing "from" and "to" query parameters.');
-  }
+  if (!from || !to) return res.status(400).send('Missing "from" and "to" query parameters.');
 
   const formattedFrom = moment(from, 'D/M/YYYY').format('YYYY-MM-DD');
   const formattedTo = moment(to, 'D/M/YYYY').format('YYYY-MM-DD');
 
-  let sql = `SELECT * FROM billing WHERE bill_date::DATE BETWEEN $1 AND $2`;
+  let sql = `SELECT * FROM billing WHERE date(bill_date) BETWEEN ? AND ?`;
   const params = [formattedFrom, formattedTo];
-  let i = 3;
 
   if (pooja_name) {
-    sql += ` AND pooja_name = $${i++}`;
+    sql += ` AND pooja_name = ?`;
     params.push(pooja_name);
   }
 
   if (username) {
-    sql += ` AND username = $${i++}`;
+    sql += ` AND username = ?`;
     params.push(username);
   }
 
   if (payment_mode) {
-    sql += ` AND LOWER(payment_mode) = $${i++}`;
+    sql += ` AND LOWER(payment_mode) = ?`;
     params.push(payment_mode.toLowerCase());
   }
 
   try {
-    const result = await db.query(sql, params);
+    const results = await dbAllAsync(sql, params);
 
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet('Temple Report');
 
-    // Add Reference ID column
     worksheet.columns = [
       { header: 'Receipt No', key: 'receipt_no', width: 15 },
       { header: 'Date & Time', key: 'bill_datetime_formatted', width: 22 },
@@ -519,7 +597,7 @@ app.get('/report/export', async (req, res) => {
       { header: 'User', key: 'username', width: 15 },
     ];
 
-    result.rows.forEach(row => {
+    results.forEach(row => {
       const datetimeRaw = row.bill_datetime || row.bill_date || null;
       const datetimeFormatted = datetimeRaw
         ? moment(new Date(datetimeRaw)).format('DD/MM/YYYY HH:mm:ss')
@@ -542,17 +620,35 @@ app.get('/report/export', async (req, res) => {
     res.setHeader('Content-Disposition', 'attachment; filename=temple-report.xlsx');
     await workbook.xlsx.write(res);
     res.end();
+
   } catch (err) {
-    console.error('❌ Export error:', err.message);
+    console.error('❌ Export error:', err);
     res.status(500).send("Database error");
   }
 });
 
 
+// Helper to promisify db.all
+function dbAllAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
 
-//const express = require('express');
-const router = express.Router();
+// Helper to promisify db.get
+function dbGetAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
 
+// GET /collections
 app.get('/collections', async (req, res) => {
   if (!req.session.user) return res.redirect('/');
 
@@ -563,15 +659,15 @@ app.get('/collections', async (req, res) => {
 
   try {
     // Billing summary for selected date
-    const billingResult = await db.query(`
+    const billingResult = await dbAllAsync(`
       SELECT payment_mode, SUM(total) AS amount
       FROM billing
-      WHERE username = $1 AND bill_date::DATE = $2
+      WHERE username = ? AND date(bill_date) = ?
       GROUP BY payment_mode
     `, [username, selectedDate]);
 
     let cash = 0, online = 0;
-    billingResult.rows.forEach(row => {
+    billingResult.forEach(row => {
       const mode = (row.payment_mode || '').toLowerCase();
       const amount = parseFloat(row.amount || 0);
       if (mode.includes('online')) online += amount;
@@ -579,59 +675,46 @@ app.get('/collections', async (req, res) => {
     });
 
     // Donations for selected date
-    const donationRes = await db.query(`
+    const donationRes = await dbGetAsync(`
       SELECT SUM(total) AS amount
       FROM billing
-      WHERE username = $1 AND bill_date::DATE = $2
-        AND pooja_name ILIKE 'Donation%'
+      WHERE username = ? AND date(bill_date) = ? AND LOWER(pooja_name) LIKE 'donation%'
     `, [username, selectedDate]);
-    const donation = parseFloat(donationRes.rows[0]?.amount || 0);
+    const donation = parseFloat(donationRes?.amount || 0);
 
     // Withdrawals for selected date
-    const withdrawalsRes = await db.query(`
+    const withdrawalsRes = await dbAllAsync(`
       SELECT * FROM withdrawals
-      WHERE username = $1 AND date::DATE = $2
+      WHERE username = ? AND date(date) = ?
       ORDER BY created_at DESC
     `, [username, selectedDate]);
 
     // Total handed over on this date
-    const sumHandoverRes = await db.query(`
+    const sumHandoverRes = await dbGetAsync(`
       SELECT SUM(handover) AS sum_handover
       FROM withdrawals
-      WHERE username = $1 AND date::DATE = $2
+      WHERE username = ? AND date(date) = ?
     `, [username, selectedDate]);
-    const alreadyWithdrawn = parseFloat(sumHandoverRes.rows[0]?.sum_handover || 0);
+    const alreadyWithdrawn = parseFloat(sumHandoverRes?.sum_handover || 0);
 
     const total = cash + online;
     const remaining = cash - alreadyWithdrawn;
 
-    // Compose daily summary object
-    const summary = {
-      cash,
-      online,
-      donation,
-      total,
-      remaining,
-      withdrawn: alreadyWithdrawn
-    };
+    const summary = { cash, online, donation, total, remaining, withdrawn: alreadyWithdrawn };
 
     res.render('collections', {
       user: username,
       today,
       filterDate,
       summary,
-      withdrawals: withdrawalsRes.rows
+      withdrawals: withdrawalsRes
     });
+
   } catch (err) {
     console.error('/collections error:', err);
     res.status(500).send('Failed to load collections: ' + err.message);
   }
 });
-
-// POST handler remains as in your original code
-
-module.exports = router;
-
 
 // POST /withdraw
 app.post('/withdraw', async (req, res) => {
@@ -643,47 +726,46 @@ app.post('/withdraw', async (req, res) => {
   const todayDate = now.toISOString().slice(0, 10); // YYYY-MM-DD
 
   try {
-    // Re-calculate for today (so today's handover never exceeds available)
-    const paymentRes = await db.query(`
+    // Get today's billing totals
+    const paymentRes = await dbAllAsync(`
       SELECT payment_mode, SUM(total) AS amount
       FROM billing
-      WHERE username = $1 AND bill_date::DATE = $2
+      WHERE username = ? AND date(bill_date) = ?
       GROUP BY payment_mode
     `, [username, todayDate]);
+
     let cash = 0, online = 0;
-    paymentRes.rows.forEach(row => {
+    paymentRes.forEach(row => {
       const mode = (row.payment_mode || '').toLowerCase();
       const amount = parseFloat(row.amount || 0);
       if (mode.includes('online')) online += amount;
       else cash += amount;
     });
 
-    // Today's donations:
-    const donationRes = await db.query(`
+    const donationRes = await dbGetAsync(`
       SELECT SUM(total) AS amount
       FROM billing
-      WHERE username = $1 AND bill_date::DATE = $2
-        AND pooja_name ILIKE 'Donation%'
+      WHERE username = ? AND date(bill_date) = ? AND LOWER(pooja_name) LIKE 'donation%'
     `, [username, todayDate]);
-    const donation = parseFloat(donationRes.rows[0]?.amount || 0);
+    const donation = parseFloat(donationRes?.amount || 0);
 
-    // Already withdrawn today:
-    const sumRes = await db.query(`
+    const sumRes = await dbGetAsync(`
       SELECT SUM(handover) AS total
-      FROM withdrawals WHERE username = $1 AND date::DATE = $2
+      FROM withdrawals
+      WHERE username = ? AND date(date) = ?
     `, [username, todayDate]);
-    const alreadyWithdrawn = parseFloat(sumRes.rows[0]?.total || 0);
+    const alreadyWithdrawn = parseFloat(sumRes?.total || 0);
 
     const remaining = cash - (alreadyWithdrawn + handover);
 
-    // Insert withdrawal:
-    await db.query(`
+    await db.run(`
       INSERT INTO withdrawals
       (username, date, cash, online, donation, handover, remaining, created_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-    `, [username, now, cash, online, donation, handover, remaining]);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, [username, now.toISOString(), cash, online, donation, handover, remaining, now.toISOString()]);
 
     res.redirect('/collections');
+
   } catch (err) {
     console.error("❌ Error saving withdrawal:", err);
     res.status(500).send("Error saving withdrawal: " + err.message);
@@ -691,17 +773,47 @@ app.post('/withdraw', async (req, res) => {
 });
 
 
+// Helper to promisify db.all
+function dbAllAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
 
+// Helper to promisify db.run
+function dbRunAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function(err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+}
 
-// Route: Add Expense
+// Helper to promisify db.get
+function dbGetAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
+
+// POST /expenses/add
 app.post('/expenses/add', async (req, res) => {
   const { expense_date, purpose, amount, added_by } = req.body;
   if (!expense_date || !purpose || !amount) {
     return res.status(400).send("All fields are required.");
   }
   try {
-    const sql = `INSERT INTO expenses (expense_date, purpose, amount, added_by) VALUES ($1, $2, $3, $4)`;
-    await db.query(sql, [expense_date, purpose, amount, added_by || 'Admin']);
+    await dbRunAsync(
+      `INSERT INTO expenses (expense_date, purpose, amount, added_by) VALUES (?, ?, ?, ?)`,
+      [expense_date, purpose, amount, added_by || 'Admin']
+    );
     res.redirect('/expenses');
   } catch (err) {
     console.error(err);
@@ -709,21 +821,31 @@ app.post('/expenses/add', async (req, res) => {
   }
 });
 
+// GET /expenses - List/Filter Expenses
 
-// Route: List/Filter Expenses in Table
+// GET /expenses - List/Filter Expenses
 app.get('/expenses', async (req, res) => {
   const { from, to } = req.query;
   let sql = `SELECT * FROM expenses`;
   const params = [];
+
   if (from && to) {
-    sql += ` WHERE expense_date BETWEEN $1 AND $2`;
+    sql += ` WHERE expense_date BETWEEN ? AND ?`;
     params.push(from, to);
   }
   sql += ` ORDER BY expense_date DESC`;
+
   try {
-    const result = await db.query(sql, params);
+    const result = await dbAllAsync(sql, params);
+
+    // Format dates for EJS
+    const formattedExpenses = result.map(e => ({
+      ...e,
+      expense_date_formatted: moment(e.expense_date).format('YYYY-MM-DD') // or 'DD/MM/YYYY'
+    }));
+
     res.render('expenses', {
-      expenses: result.rows,
+      expenses: formattedExpenses,
       from: from || '',
       to: to || ''
     });
@@ -733,18 +855,20 @@ app.get('/expenses', async (req, res) => {
   }
 });
 
-// Route: Export Excel
+// GET /expenses/export - Export to Excel
 app.get('/expenses/export', async (req, res) => {
   const { from, to } = req.query;
   let sql = `SELECT * FROM expenses`;
   const params = [];
+
   if (from && to) {
-    sql += ` WHERE expense_date BETWEEN $1 AND $2`;
+    sql += ` WHERE expense_date BETWEEN ? AND ?`;
     params.push(from, to);
   }
   sql += ` ORDER BY expense_date DESC`;
+
   try {
-    const result = await db.query(sql, params);
+    const result = await dbAllAsync(sql, params);
 
     const ExcelJS = require('exceljs');
     const moment = require('moment');
@@ -758,7 +882,7 @@ app.get('/expenses/export', async (req, res) => {
       { header: 'Added By', key: 'added_by', width: 20 },
     ];
 
-    result.rows.forEach(row => {
+    result.forEach(row => {
       worksheet.addRow({
         expense_date: moment(row.expense_date).format('DD/MM/YYYY'),
         purpose: row.purpose,
@@ -777,10 +901,7 @@ app.get('/expenses/export', async (req, res) => {
   }
 });
 
-
-
-module.exports = router;
-
+// Start server
 app.listen(3000, () => {
   console.log('✅ Temple Billing running at http://localhost:3000');
 });
